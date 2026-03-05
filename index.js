@@ -9,8 +9,6 @@
  * IMPORTANT:
  *  - This bot assumes your Google Apps Script WebApp accepts JSON:
  *    { secret, action, ...payload }
- *  - If your Apps Script currently returns always "POST OK" (because of duplicate doPost),
- *    nothing will work until you remove the duplicate doPost/doGet at the bottom.
  */
 
 const express = require("express");
@@ -26,7 +24,7 @@ const GAS_URL = mustStr("GAS_URL");        // Apps Script WebApp URL (exec)
 const GAS_SECRET = mustStr("GAS_SECRET");  // must match API_SECRET in Apps Script
 
 // Optional: onboarding payment link (if you want)
-const SAAS_CONNECT_PAY_URL = str("SAAS_CONNECT_PAY_URL", ""); // e.g. Stripe checkout for SaaS connection fee
+const SAAS_CONNECT_PAY_URL = str("SAAS_CONNECT_PAY_URL", "");
 
 // Optional: super admin chat id (platform owner)
 const SUPER_ADMIN_CHAT_ID = Number(str("SUPER_ADMIN_CHAT_ID", "0")) || 0;
@@ -214,15 +212,6 @@ function ensureState(ctx) {
   return ctx.session;
 }
 
-// flow fields used:
-// flow.salonId
-// flow.mode = "client"|"admin"
-// flow.selectedService { serviceId, name, description, durationMin, price, currency, masterName? }
-// flow.selectedMasterName
-// flow.slotsPageToken
-// flow.lastSlotsRequest { masterName, durationMin, pageToken }
-// flow.booking { bookingId, ... }
-
 function L(ctx) {
   const s = ensureState(ctx);
   return T[s.lang] || T[DEFAULT_LANG];
@@ -240,6 +229,28 @@ function mainMenuKb(ctx) {
   );
 }
 
+// -------------------- salonId normalizer (FIX) --------------------
+// Accepts: "salon003", "salon_003", "003", "salon3", "salon_3"
+// Returns: "salon_003" (pad to 3 digits)
+function normalizeSalonId(input) {
+  const raw = String(input || "").trim();
+
+  // already salon_XXX
+  let m = raw.match(/^salon_(\d{1,6})$/i);
+  if (m) return `salon_${m[1].padStart(3, "0")}`;
+
+  // salonXXX (no underscore)
+  m = raw.match(/^salon(\d{1,6})$/i);
+  if (m) return `salon_${m[1].padStart(3, "0")}`;
+
+  // just digits
+  m = raw.match(/^(\d{1,6})$/);
+  if (m) return `salon_${m[1].padStart(3, "0")}`;
+
+  // unknown format -> keep as is (but it will likely fail in GAS)
+  return raw;
+}
+
 // -------------------- GAS API helper --------------------
 async function gasCall(action, payload) {
   const res = await fetch(GAS_URL, {
@@ -250,7 +261,6 @@ async function gasCall(action, payload) {
 
   const text = await res.text();
 
-  // Apps Script sometimes returns non-JSON if misconfigured.
   let data = null;
   try {
     data = JSON.parse(text);
@@ -259,6 +269,8 @@ async function gasCall(action, payload) {
   }
 
   if (!data || data.ok !== true) {
+    // IMPORTANT: show exact GAS error in Railway logs
+    console.error("GAS ERROR:", { action, payload, data });
     throw new Error(data?.error || "GAS error");
   }
   return data;
@@ -269,23 +281,24 @@ bot.start(async (ctx) => {
   const s = ensureState(ctx);
   const t = L(ctx);
 
-  const startParam = (ctx.startPayload || "").trim(); // Telegraf provides startPayload
-  if (!startParam) {
-    // default: no param => show main menu but warn
+  const startParamRaw = (ctx.startPayload || "").trim();
+  if (!startParamRaw) {
     s.flow = { mode: "client" };
     await ctx.reply(t.err_no_salon, mainMenuKb(ctx));
     return;
   }
 
-  if (startParam.startsWith("admin_")) {
-    const salonId = startParam.replace(/^admin_/, "").trim();
+  // admin mode
+  if (startParamRaw.startsWith("admin_")) {
+    const salonIdRaw = startParamRaw.replace(/^admin_/, "").trim();
+    const salonId = normalizeSalonId(salonIdRaw); // FIX
     s.flow = { mode: "admin", salonId };
     await showAdminOnboarding(ctx);
     return;
   }
 
   // client mode
-  const salonId = startParam.trim();
+  const salonId = normalizeSalonId(startParamRaw); // FIX
   s.flow = { mode: "client", salonId };
   await ctx.reply(t.pick_action, mainMenuKb(ctx));
 });
@@ -298,7 +311,6 @@ async function showAdminOnboarding(ctx) {
 
   const buttons = [];
   if (SAAS_CONNECT_PAY_URL) {
-    // payment url button (open link)
     buttons.push([Markup.button.url(t.admin_pay_btn, SAAS_CONNECT_PAY_URL)]);
   }
   buttons.push([Markup.button.callback(t.admin_trial_btn, `adm_trial:${salonId}`)]);
@@ -312,7 +324,9 @@ async function showAdminOnboarding(ctx) {
 bot.action(/adm_trial:(.+)/, async (ctx) => {
   const s = ensureState(ctx);
   const t = L(ctx);
-  const salonId = ctx.match[1];
+
+  // FIX: normalize salonId even from callback
+  const salonId = normalizeSalonId(ctx.match[1]);
 
   try {
     const adminChatId = String(ctx.chat.id);
@@ -324,14 +338,13 @@ bot.action(/adm_trial:(.+)/, async (ctx) => {
       adminUsername,
     });
 
-    // Fix links (<BotName>) with real bot username if possible
     const botUser = await ctx.telegram.getMe();
-    const botName = botUser.username ? `@${botUser.username}` : "<BotName>";
 
+    // FIX: links must use normalized salonId with underscore
     const clientLink = `https://t.me/${botUser.username}?start=${salonId}`;
     const adminLink = `https://t.me/${botUser.username}?start=admin_${salonId}`;
 
-    await ctx.editMessageReplyMarkup(); // remove buttons
+    await ctx.editMessageReplyMarkup();
     await ctx.replyWithMarkdown(
       t.admin_trial_ok({
         ...data,
@@ -370,7 +383,6 @@ bot.hears([T.ua.menu_lang, T.ru.menu_lang, T.en.menu_lang], async (ctx) => {
 
 bot.action(/lang:(ua|ru|en)/, async (ctx) => {
   const s = ensureState(ctx);
-  const tOld = L(ctx);
   const newLang = ctx.match[1];
 
   s.lang = newLang;
@@ -398,7 +410,6 @@ bot.hears([T.ua.menu_contacts, T.ru.menu_contacts, T.en.menu_contacts], async (c
   try {
     const meta = await gasCall("getSalonMeta", { salonId });
 
-    // expected meta fields: address, phone, mapsUrl
     const address = meta.address || meta.meta?.address || "";
     const phone = meta.phone || meta.meta?.phone || "";
     const mapsUrl = meta.mapsUrl || meta.meta?.mapsUrl || meta.meta?.googleMaps || "";
@@ -421,14 +432,13 @@ bot.hears([T.ua.menu_services, T.ru.menu_services, T.en.menu_services], async (c
   const salonId = s.flow?.salonId;
   if (!salonId) return ctx.reply(t.err_no_salon, mainMenuKb(ctx));
 
-  // reset selection
   s.flow.selectedService = null;
   s.flow.selectedMasterName = null;
   s.flow.slotsPageToken = null;
   s.flow.booking = null;
 
   try {
-    const list = await gasCall("listServices", { salonId }); // expects array: services
+    const list = await gasCall("listServices", { salonId });
     const services = list.services || list.items || list;
 
     if (!Array.isArray(services) || services.length === 0) {
@@ -436,7 +446,7 @@ bot.hears([T.ua.menu_services, T.ru.menu_services, T.en.menu_services], async (c
     }
 
     await ctx.replyWithMarkdown(t.choose_service, servicesKb(ctx, services));
-  } catch (e) {
+  } catch {
     await ctx.reply(t.err_generic, mainMenuKb(ctx));
   }
 });
@@ -444,7 +454,6 @@ bot.hears([T.ua.menu_services, T.ru.menu_services, T.en.menu_services], async (c
 function servicesKb(ctx, services) {
   const t = L(ctx);
 
-  // show up to 30, 2 per row
   const buttons = [];
   const max = Math.min(30, services.length);
 
@@ -452,8 +461,6 @@ function servicesKb(ctx, services) {
     const row = [];
     for (let j = i; j < i + 2 && j < max; j++) {
       const s = services[j];
-
-      // serviceId preferred, else name-based
       const serviceId = String(s.serviceId || s.id || s.key || s.name || `svc_${j}`);
       const title = s.price
         ? `${s.name} — ${s.price} ${s.currency || ""}`.trim()
@@ -465,15 +472,12 @@ function servicesKb(ctx, services) {
   }
 
   buttons.push([Markup.button.callback(t.back, "home")]);
-
   return Markup.inlineKeyboard(buttons);
 }
 
 bot.action("home", async (ctx) => {
   const t = L(ctx);
-  try {
-    await ctx.editMessageReplyMarkup();
-  } catch (_) {}
+  try { await ctx.editMessageReplyMarkup(); } catch (_) {}
   await ctx.reply(t.pick_action, mainMenuKb(ctx));
   try { await ctx.answerCbQuery(); } catch (_) {}
 });
@@ -490,17 +494,13 @@ bot.action(/svc:(.+)/, async (ctx) => {
   }
 
   try {
-    // Prefer: listServices returns full objects, so we refetch and find by id (safe & simple)
     const list = await gasCall("listServices", { salonId });
     const services = list.services || list.items || list;
 
     const svc = (services || []).find((x) => String(x.serviceId || x.id || x.key || x.name) === String(serviceId))
       || (services || []).find((x) => String(x.name) === String(serviceId));
 
-    if (!svc) {
-      await ctx.reply(t.err_generic, mainMenuKb(ctx));
-      return;
-    }
+    if (!svc) return ctx.reply(t.err_generic, mainMenuKb(ctx));
 
     s.flow.selectedService = {
       serviceId: String(svc.serviceId || svc.id || serviceId),
@@ -509,7 +509,7 @@ bot.action(/svc:(.+)/, async (ctx) => {
       durationMin: Number(svc.durationMin || svc.duration || 60),
       price: Number(svc.price || 0),
       currency: String(svc.currency || ""),
-      masterName: svc.masterName ? String(svc.masterName) : "", // if "service+master row"
+      masterName: svc.masterName ? String(svc.masterName) : "",
     };
 
     const buttons = [];
@@ -520,7 +520,7 @@ bot.action(/svc:(.+)/, async (ctx) => {
       t.service_details(s.flow.selectedService),
       { parse_mode: "Markdown", reply_markup: Markup.inlineKeyboard(buttons).reply_markup }
     );
-  } catch (e) {
+  } catch {
     await ctx.reply(t.err_generic, mainMenuKb(ctx));
   } finally {
     try { await ctx.answerCbQuery(); } catch (_) {}
@@ -555,7 +555,6 @@ bot.action("svc_pick_master", async (ctx) => {
   if (!salonId || !selectedService) return;
 
   try {
-    // If service already has masterName (service+master row in Services), we skip master choosing.
     if (selectedService.masterName) {
       s.flow.selectedMasterName = selectedService.masterName;
       s.flow.slotsPageToken = null;
@@ -563,21 +562,18 @@ bot.action("svc_pick_master", async (ctx) => {
       return;
     }
 
-    // Else: list masters able to do this service
-    const mastersRes = await gasCall("listMasters", { salonId }); // expects masters list with skills or just list
+    const mastersRes = await gasCall("listMasters", { salonId });
     const masters = mastersRes.masters || mastersRes.items || mastersRes;
 
     if (!Array.isArray(masters) || masters.length === 0) {
       return ctx.reply(t.no_masters, mainMenuKb(ctx));
     }
 
-    // Filter rule: 1 master = 1 service OR master has services list
     const filtered = masters.filter((m) => {
       if (m.serviceId) return String(m.serviceId) === String(selectedService.serviceId);
       if (m.services && Array.isArray(m.services)) {
         return m.services.some((x) => String(x.serviceId || x.id || x.name) === String(selectedService.serviceId));
       }
-      // if no info — keep (fallback)
       return true;
     });
 
@@ -657,7 +653,6 @@ bot.hears([T.ua.menu_masters, T.ru.menu_masters, T.en.menu_masters], async (ctx)
   const salonId = s.flow?.salonId;
   if (!salonId) return ctx.reply(t.err_no_salon, mainMenuKb(ctx));
 
-  // reset selection
   s.flow.selectedService = null;
   s.flow.selectedMasterName = null;
   s.flow.slotsPageToken = null;
@@ -678,14 +673,11 @@ bot.hears([T.ua.menu_masters, T.ru.menu_masters, T.en.menu_masters], async (ctx)
 });
 
 bot.action(/mbranch_mst:(.+)/, async (ctx) => {
-  // unused in this simplified version (mastersKb uses mst:)
   try { await ctx.answerCbQuery(); } catch (_) {}
 });
 
 // When master picked in masters branch: show master services
 bot.action(/mst:(.+)/, async (ctx, next) => {
-  // We already handle mst: above for service branch.
-  // Here we detect if selectedService is null => masters branch.
   const s = ensureState(ctx);
   if (s.flow?.selectedService) return next();
 
@@ -821,11 +813,10 @@ async function showSlots(ctx, { reset }) {
 
   const slots = res.slots || res.items || [];
   const nextToken = res.nextPageToken || res.nextToken || "";
-  const prevToken = res.prevPageToken || res.prevToken || ""; // optional if GAS provides
+  const prevToken = res.prevPageToken || res.prevToken || "";
 
   if (!Array.isArray(slots) || slots.length === 0) {
     const kb = Markup.inlineKeyboard([[Markup.button.callback(t.back, "home")]]);
-    // edit if possible, else reply
     try {
       await ctx.editMessageText(t.no_slots, { reply_markup: kb.reply_markup });
     } catch {
@@ -854,7 +845,6 @@ function slotsKb(ctx, slots, { nextToken, prevToken }) {
     const row = [];
     for (let j = i; j < i + 2 && j < slots.length; j++) {
       const sl = slots[j];
-      // expected: { startIso, endIso, label, slotId? } or similar
       const label = String(sl.label || sl.start || sl.startIso || "");
       const token = String(sl.slotId || sl.startIso || sl.start || label);
       row.push(Markup.button.callback(label.slice(0, 40), `slot:${encode(token)}`));
@@ -883,7 +873,6 @@ bot.action(/slots_next:(.+)/, async (ctx) => {
 });
 
 bot.action(/slots_prev:(.+)/, async (ctx) => {
-  // if GAS doesn't provide prevToken, ignore
   const s = ensureState(ctx);
   const token = decode(ctx.match[1]);
   s.flow.slotsPageToken = token;
@@ -907,7 +896,6 @@ bot.action(/slot:(.+)/, async (ctx) => {
   if (!salonId || !masterName || !svc) return;
 
   try {
-    // create booking BEFORE payment (your rule)
     const bookingData = {
       clientChatId: String(ctx.chat.id),
       clientUsername: String(ctx.from.username || ""),
@@ -918,7 +906,7 @@ bot.action(/slot:(.+)/, async (ctx) => {
       durationMin: Number(svc.durationMin || 60),
       price: Number(svc.price || 0),
       currency: String(svc.currency || ""),
-      slotToken, // Apps Script decides how to interpret (startIso etc.)
+      slotToken,
       createdAt: new Date().toISOString(),
       language: s.lang,
     };
@@ -933,7 +921,7 @@ bot.action(/slot:(.+)/, async (ctx) => {
     );
 
     await showPaymentMenu(ctx);
-  } catch (e) {
+  } catch {
     await ctx.reply(t.err_generic, mainMenuKb(ctx));
   } finally {
     try { await ctx.answerCbQuery(); } catch (_) {}
@@ -943,8 +931,6 @@ bot.action(/slot:(.+)/, async (ctx) => {
 async function showPaymentMenu(ctx) {
   const s = ensureState(ctx);
   const t = L(ctx);
-  const salonId = s.flow?.salonId;
-  const bookingId = s.flow?.booking?.bookingId;
 
   const kb = Markup.inlineKeyboard([
     [Markup.button.callback(t.pay_online, "pay:online")],
@@ -953,9 +939,6 @@ async function showPaymentMenu(ctx) {
   ]);
 
   await ctx.replyWithMarkdown(`*${t.pay_title}*`, kb);
-
-  // Optionally: keep last message clean
-  if (!salonId || !bookingId) return;
 }
 
 bot.action(/pay:(online|cash)/, async (ctx) => {
@@ -972,7 +955,6 @@ bot.action(/pay:(online|cash)/, async (ctx) => {
 
   try {
     if (ctx.match[1] === "online") {
-      // set payment status WAITING + provide payment link from Meta
       const meta = await gasCall("getSalonMeta", { salonId });
       const onlinePaymentUrl =
         meta.onlinePaymentUrl || meta.meta?.onlinePaymentUrl || meta.paymentUrl || meta.meta?.paymentUrl || "";
@@ -982,7 +964,6 @@ bot.action(/pay:(online|cash)/, async (ctx) => {
         return;
       }
 
-      // update booking pay method/status
       await gasCall("updateBookingPaymentStatus", {
         salonId,
         bookingId,
@@ -998,7 +979,6 @@ bot.action(/pay:(online|cash)/, async (ctx) => {
         Markup.inlineKeyboard([[Markup.button.url(t.pay_online, link)]])
       );
     } else {
-      // CASH
       await gasCall("updateBookingPaymentStatus", {
         salonId,
         bookingId,
@@ -1018,11 +998,13 @@ bot.action(/pay:(online|cash)/, async (ctx) => {
   }
 });
 
-// -------------------- Cancel booking (button from reminders or any message) --------------------
+// -------------------- Cancel booking --------------------
 bot.action(/cancel:(.+):(.+)/, async (ctx) => {
   const t = L(ctx);
   const bookingId = decode(ctx.match[1]);
-  const salonId = decode(ctx.match[2]);
+
+  // FIX: normalize salonId decoded from callback
+  const salonId = normalizeSalonId(decode(ctx.match[2]));
 
   try {
     await gasCall("cancelBooking", {
@@ -1042,16 +1024,12 @@ bot.action(/cancel:(.+):(.+)/, async (ctx) => {
 // -------------------- Fallback text handler --------------------
 bot.on("text", async (ctx) => {
   const t = L(ctx);
-  // Don’t break user chat: keep menu always visible
   await ctx.reply(t.pick_action, mainMenuKb(ctx));
 });
 
 // -------------------- Payment webhook (universal) --------------------
 app.post(PAY_WEBHOOK_PATH, async (req, res) => {
   try {
-    // Expected minimal payload:
-    // { salonId, bookingId, status, providerTxId, paidAt }
-    // status: "PAID" / ...
     const { salonId, bookingId, status, providerTxId, paidAt } = req.body || {};
 
     if (!salonId || !bookingId) {
@@ -1059,11 +1037,14 @@ app.post(PAY_WEBHOOK_PATH, async (req, res) => {
       return;
     }
 
+    // FIX: normalize salonId from webhook payload
+    const sid = normalizeSalonId(String(salonId));
+
     const payStatus = String(status || "PAID").toUpperCase();
     const paidAtIso = paidAt ? String(paidAt) : new Date().toISOString();
 
     await gasCall("updateBookingPaymentStatus", {
-      salonId: String(salonId),
+      salonId: sid,
       bookingId: String(bookingId),
       payStatus,
       providerTxId: providerTxId ? String(providerTxId) : "",
@@ -1080,7 +1061,6 @@ app.post(PAY_WEBHOOK_PATH, async (req, res) => {
 app.use(bot.webhookCallback(WEBHOOK_PATH));
 
 (async () => {
-  // set telegram webhook
   await bot.telegram.setWebhook(`${PUBLIC_URL}${WEBHOOK_PATH}`);
   app.listen(PORT, () => console.log(`OK: ${PORT}`));
 })().catch((e) => {
